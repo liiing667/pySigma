@@ -1,5 +1,6 @@
 import pytest
-from sigma.exceptions import SigmaPipelineConditionError
+import yaml
+from sigma.exceptions import SigmaConfigurationError, SigmaPipelineConditionError
 from sigma.processing.condition_expressions import (
     ConditionOR,
     ConditionAND,
@@ -7,6 +8,7 @@ from sigma.processing.condition_expressions import (
     ConditionNOT,
     parse_condition_expression,
 )
+from sigma.processing.pipeline import ProcessingItem, ProcessingPipeline
 from tests.test_processing_pipeline import (
     RuleConditionFalse,
     RuleConditionTrue,
@@ -14,6 +16,7 @@ from tests.test_processing_pipeline import (
     DetectionItemConditionTrue,
     FieldNameConditionFalse,
     FieldNameConditionTrue,
+    TransformationAppend,
 )
 from tests.test_rule import sigma_rule, detection_item
 
@@ -250,3 +253,140 @@ def test_pipeline_condition_expression_set_pipeline_twice(sigma_rule):
     result.set_pipeline(pipeline)
     with pytest.raises(SigmaError, match="Pipeline already set"):
         result.set_pipeline(pipeline)
+
+
+def test_automatic_identifier_covers_rule_condition_expression():
+    first = ProcessingItem(
+        transformation=TransformationAppend(s="Test"),
+        rule_conditions={"cond1": RuleConditionTrue(dummy="test-true")},
+        rule_condition_expression=parse_condition_expression("cond1"),
+    )
+    second = ProcessingItem(
+        transformation=TransformationAppend(s="Test"),
+        rule_conditions={"cond1": RuleConditionTrue(dummy="test-true")},
+        rule_condition_expression=parse_condition_expression("not cond1"),
+    )
+
+    assert first.identifier != second.identifier
+
+
+def test_automatic_identifier_covers_detection_item_condition_expression():
+    first = ProcessingItem(
+        transformation=TransformationAppend(s="Test"),
+        detection_item_conditions={"cond1": DetectionItemConditionTrue(dummy="test-true")},
+        detection_item_condition_expression=parse_condition_expression("cond1"),
+    )
+    second = ProcessingItem(
+        transformation=TransformationAppend(s="Test"),
+        detection_item_conditions={"cond1": DetectionItemConditionTrue(dummy="test-true")},
+        detection_item_condition_expression=parse_condition_expression("not cond1"),
+    )
+
+    assert first.identifier != second.identifier
+
+
+def test_automatic_identifier_covers_field_name_condition_expression():
+    first = ProcessingItem(
+        transformation=TransformationAppend(s="Test"),
+        field_name_conditions={"cond1": FieldNameConditionTrue(dummy="test-true")},
+        field_name_condition_expression=parse_condition_expression("cond1"),
+    )
+    second = ProcessingItem(
+        transformation=TransformationAppend(s="Test"),
+        field_name_conditions={"cond1": FieldNameConditionTrue(dummy="test-true")},
+        field_name_condition_expression=parse_condition_expression("not cond1"),
+    )
+
+    assert first.identifier != second.identifier
+
+
+def test_automatic_identifier_covers_condition_references():
+    first = ProcessingItem(
+        transformation=TransformationAppend(s="Test"),
+        rule_conditions={
+            "match": RuleConditionTrue(dummy="test-true"),
+            "exclude": RuleConditionFalse(dummy="test-false"),
+        },
+        rule_condition_expression=parse_condition_expression("match and not exclude"),
+    )
+    second = ProcessingItem(
+        transformation=TransformationAppend(s="Test"),
+        rule_conditions={
+            "exclude": RuleConditionTrue(dummy="test-true"),
+            "match": RuleConditionFalse(dummy="test-false"),
+        },
+        rule_condition_expression=parse_condition_expression("match and not exclude"),
+    )
+
+    assert first.identifier != second.identifier
+
+
+def test_automatic_identifier_covers_transformation_parameters():
+    first = ProcessingItem(transformation=TransformationAppend(s="First"))
+    second = ProcessingItem(transformation=TransformationAppend(s="Second"))
+
+    assert first.identifier != second.identifier
+
+
+def test_automatic_identifier_stable_after_yaml_roundtrip_and_merge():
+    definitions = {
+        "transformations": [
+            {
+                "type": "field_name_prefix",
+                "prefix": "prefix_",
+                "rule_conditions": {"cond1": {"type": "is_sigma_rule"}},
+                "rule_cond_expr": "cond1",
+            },
+            {
+                "type": "field_name_prefix",
+                "prefix": "prefix_",
+                "rule_conditions": {"cond1": {"type": "is_sigma_rule"}},
+                "rule_cond_expr": "not cond1",
+            },
+        ]
+    }
+    pipeline = ProcessingPipeline.from_dict(definitions)
+    roundtrip = ProcessingPipeline.from_yaml(yaml.safe_dump(definitions))
+    merged = pipeline + ProcessingPipeline()
+
+    identifiers = [item.identifier for item in pipeline.items]
+    assert identifiers == [item.identifier for item in roundtrip.items]
+    assert identifiers == [item.identifier for item in merged.items]
+
+
+def test_explicit_processing_item_identifier_conflict():
+    with pytest.raises(
+        SigmaConfigurationError, match="Duplicate explicit processing item identifier 'test'"
+    ):
+        ProcessingPipeline.from_dict(
+            {
+                "transformations": [
+                    {"id": "test", "type": "field_name_prefix", "prefix": "first_"},
+                    {"id": "test", "type": "field_name_prefix", "prefix": "second_"},
+                ]
+            }
+        )
+
+
+def test_explicit_processing_item_identifier_conflict_after_merge():
+    first_pipeline = ProcessingPipeline(
+        items=[
+            ProcessingItem(
+                transformation=TransformationAppend(s="First"),
+                identifier="duplicate",
+            )
+        ]
+    )
+    second_pipeline = ProcessingPipeline(
+        items=[
+            ProcessingItem(
+                transformation=TransformationAppend(s="Second"),
+                identifier="duplicate",
+            )
+        ]
+    )
+
+    with pytest.raises(
+        SigmaConfigurationError, match="Duplicate explicit processing item identifier 'duplicate'"
+    ):
+        first_pipeline + second_pipeline

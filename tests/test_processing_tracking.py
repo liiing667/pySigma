@@ -1,5 +1,9 @@
 import pytest
+from sigma.processing.condition_expressions import parse_condition_expression
+from sigma.processing.pipeline import ProcessingItem, ProcessingPipeline
 from sigma.processing.tracking import FieldMappingTracking
+from tests.test_processing_pipeline import RuleConditionTrue, TransformationAppend
+from tests.test_rule import sigma_rule
 
 
 @pytest.fixture
@@ -42,3 +46,24 @@ def test_field_mapping_tracking_merge():
     assert field_mapping_tracking["fieldA"] == {"mappedD"}
     assert field_mapping_tracking["fieldB"] == {"mappedC"}
     assert field_mapping_tracking["fieldC"] == {"mappedE"}
+
+
+def test_pipeline_tracks_distinct_automatic_identifiers(sigma_rule):
+    first = ProcessingItem(
+        transformation=TransformationAppend(s="Test"),
+        rule_conditions={"cond": RuleConditionTrue(dummy="same-condition-value")},
+        rule_condition_expression=parse_condition_expression("cond"),
+    )
+    second = ProcessingItem(
+        transformation=TransformationAppend(s="Test"),
+        rule_conditions={"cond": RuleConditionTrue(dummy="same-condition-value")},
+        rule_condition_expression=parse_condition_expression("not cond"),
+    )
+    pipeline = ProcessingPipeline(items=[first, second])
+
+    pipeline.apply(sigma_rule)
+
+    assert first.identifier != second.identifier
+    assert sigma_rule.was_processed_by(first.identifier)
+    assert not sigma_rule.was_processed_by(second.identifier)
+    assert pipeline.applied_ids == {first.identifier}

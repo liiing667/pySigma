@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
+import dataclasses
+from enum import Enum
 from functools import partial
 import hashlib
+import json
 import os
+import re
 from typing import (
     Literal,
     Mapping,
@@ -19,7 +23,14 @@ from typing import (
     TYPE_CHECKING,
 )
 
-from sigma.processing.condition_expressions import ConditionExpression, parse_condition_expression
+from sigma.processing.condition_expressions import (
+    ConditionAND,
+    ConditionExpression,
+    ConditionIdentifier,
+    ConditionNOT,
+    ConditionOR,
+    parse_condition_expression,
+)
 from sigma.processing.conditions.base import ProcessingCondition
 from sigma.processing.finalization import Finalizer, NestedFinalizer, finalizers
 from sigma.processing.templates import TemplateBase
@@ -75,6 +86,7 @@ class ProcessingItemBase:
     identifier: str | None = None
     policy: "SigmaPolicy | None" = field(default=None, compare=False)
     _pipeline: "ProcessingPipeline" | None = field(init=False, compare=False, default=None)
+    _identifier_explicit: bool = field(init=False, compare=False, repr=False, default=False)
 
     @classmethod
     def _base_args_from_dict(
@@ -175,44 +187,286 @@ class ProcessingItemBase:
             cast(dict[str, ProcessingCondition], self.rule_conditions),
             "Rule condition",
         )
-        if self.identifier is None or self.identifier == "":
+        self._identifier_explicit = self.identifier is not None and self.identifier != ""
+        self._ensure_identifier()
+
+    def _ensure_identifier(self) -> None:
+        """Set an automatic identifier if no explicit non-empty identifier was provided."""
+        if not self._identifier_explicit:
             self.identifier = self._generate_identifier()
 
+    @classmethod
+    def _canonical_identifier_value(
+        cls,
+        value: Any,
+        seen: set[int] | None = None,
+    ) -> Any:
+        """Convert a value into a deterministic, JSON-serializable representation.
+
+        Runtime-only fields such as pipeline and processing-item back-references are excluded.
+        Dataclass fields that take part in equality are included, which captures transformation
+        and condition parameters without depending on object ``repr`` output.
+        """
+        if seen is None:
+            seen = set()
+
+        if value is None or isinstance(value, (str, bool, int)):
+            return value
+        if isinstance(value, float):
+            return ["float", repr(value)]
+        if isinstance(value, bytes):
+            return ["bytes", value.hex()]
+        if isinstance(value, Enum):
+            return [
+                "enum",
+                f"{type(value).__module__}.{type(value).__qualname__}",
+                value.name,
+            ]
+        if isinstance(value, ConditionExpression):
+            return cls._canonical_condition_expression(value)
+        if isinstance(value, dict):
+            value_id = id(value)
+            if value_id in seen:
+                return ["recursive", type(value).__name__]
+            seen.add(value_id)
+            try:
+                entries = [
+                    [
+                        cls._canonical_identifier_value(key, seen),
+                        cls._canonical_identifier_value(item, seen),
+                    ]
+                    for key, item in value.items()
+                ]
+                entries.sort(
+                    key=lambda entry: json.dumps(
+                        entry[0], sort_keys=True, separators=(",", ":"), ensure_ascii=True
+                    )
+                )
+                return ["mapping", entries]
+            finally:
+                seen.remove(value_id)
+        if isinstance(value, (list, tuple)):
+            value_id = id(value)
+            if value_id in seen:
+                return ["recursive", type(value).__name__]
+            seen.add(value_id)
+            try:
+                return [
+                    "sequence",
+                    [cls._canonical_identifier_value(item, seen) for item in value],
+                ]
+            finally:
+                seen.remove(value_id)
+        if isinstance(value, (set, frozenset)):
+            value_id = id(value)
+            if value_id in seen:
+                return ["recursive", type(value).__name__]
+            seen.add(value_id)
+            try:
+                items = [cls._canonical_identifier_value(item, seen) for item in value]
+                items.sort(
+                    key=lambda item: json.dumps(
+                        item, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+                    )
+                )
+                return [type(value).__name__, items]
+            finally:
+                seen.remove(value_id)
+        if isinstance(value, SigmaType):
+            try:
+                plain_value = value.to_plain()
+            except Exception:
+                pass
+            else:
+                if plain_value is not value and not isinstance(plain_value, SigmaType):
+                    return [
+                        "sigma_type",
+                        f"{type(value).__module__}.{type(value).__qualname__}",
+                        cls._canonical_identifier_value(plain_value, seen),
+                    ]
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            value_id = id(value)
+            if value_id in seen:
+                return ["recursive", f"{type(value).__module__}.{type(value).__qualname__}"]
+            seen.add(value_id)
+            try:
+                fields = []
+                for dataclass_field in dataclasses.fields(value):
+                    if dataclass_field.name in {"processing_item", "pipeline", "_pipeline"}:
+                        continue
+                    if dataclass_field.name.startswith("_") and dataclass_field.name != (
+                        "_nested_pipeline"
+                    ):
+                        continue
+                    if not dataclass_field.compare:
+                        continue
+                    if (
+                        not dataclass_field.init
+                        and not dataclass_field.repr
+                        and dataclass_field.name != "_nested_pipeline"
+                    ):
+                        continue
+                    fields.append(
+                        [
+                            dataclass_field.name,
+                            cls._canonical_identifier_value(
+                                getattr(value, dataclass_field.name), seen
+                            ),
+                        ]
+                    )
+                return [
+                    "dataclass",
+                    f"{type(value).__module__}.{type(value).__qualname__}",
+                    fields,
+                ]
+            finally:
+                seen.remove(value_id)
+        if callable(value):
+            if value is any:
+                return ["callable", "any"]
+            if value is all:
+                return ["callable", "all"]
+            return [
+                "callable",
+                f"{getattr(value, '__module__', '')}.{getattr(value, '__qualname__', repr(value))}",
+            ]
+        if isinstance(value, re.Pattern):
+            return ["regex", value.pattern]
+        if hasattr(value, "__dict__"):
+            value_id = id(value)
+            if value_id in seen:
+                return ["recursive", f"{type(value).__module__}.{type(value).__qualname__}"]
+            seen.add(value_id)
+            try:
+                public_state = {
+                    key: item for key, item in vars(value).items() if not key.startswith("_")
+                }
+                if public_state:
+                    return [
+                        "object",
+                        f"{type(value).__module__}.{type(value).__qualname__}",
+                        cls._canonical_identifier_value(public_state, seen),
+                    ]
+            finally:
+                seen.remove(value_id)
+        representation = re.sub(r"0x[0-9a-fA-F]+", "0x…", repr(value))
+        return [
+            "value",
+            f"{type(value).__module__}.{type(value).__qualname__}",
+            representation,
+        ]
+
+    @classmethod
+    def _canonical_condition_expression(
+        cls,
+        expression: ConditionExpression,
+    ) -> Any:
+        """Serialize a condition expression without source locations or whitespace."""
+        if isinstance(expression, ConditionIdentifier):
+            return ["identifier", expression.identifier]
+        if isinstance(expression, ConditionNOT):
+            return ["not", cls._canonical_condition_expression(expression.condition)]
+        if isinstance(expression, (ConditionAND, ConditionOR)):
+            operator = "and" if isinstance(expression, ConditionAND) else "or"
+            return [
+                operator,
+                cls._canonical_condition_expression(expression.left),
+                cls._canonical_condition_expression(expression.right),
+            ]
+        if dataclasses.is_dataclass(expression):
+            return [
+                "condition_expression",
+                f"{type(expression).__module__}.{type(expression).__qualname__}",
+                [
+                    [
+                        dataclass_field.name,
+                        cls._canonical_identifier_value(getattr(expression, dataclass_field.name)),
+                    ]
+                    for dataclass_field in dataclasses.fields(expression)
+                    if dataclass_field.compare
+                    and dataclass_field.name not in {"location", "expression", "pipeline"}
+                    and not dataclass_field.name.startswith("_")
+                ],
+            ]
+        return cls._canonical_identifier_value(expression)
+
+    @classmethod
+    def _canonical_conditions(
+        cls,
+        conditions: list[ProcessingCondition] | dict[str, ProcessingCondition],
+        expression: ConditionExpression | None,
+    ) -> Any:
+        """Serialize condition definitions, retaining expression reference keys."""
+        if isinstance(conditions, dict):
+            if expression is None:
+                return ["list", [cls._canonical_identifier_value(c) for c in conditions.values()]]
+            return cls._canonical_identifier_value(conditions)
+        return cls._canonical_identifier_value(conditions)
+
+    @classmethod
+    def _canonical_linking(
+        cls,
+        linking: Callable[[Iterable[bool]], bool] | None,
+        expression: ConditionExpression | None,
+    ) -> Any:
+        """Serialize condition linking while accounting for the default ``all`` linking."""
+        if expression is None and linking is None:
+            return "all"
+        return cls._canonical_identifier_value(linking)
+
     def _generate_identifier(self) -> str:
-        """Generate a deterministic identifier based on the transformation and conditions."""
-        content = []
+        """Generate a deterministic identifier covering the complete item semantics."""
+        content: dict[str, Any] = {
+            "transformation": self._canonical_identifier_value(self.transformation),
+        }
 
-        if self.transformation is not None:
-            content.append(str(type(self.transformation).__name__))
-            transformation_dict = getattr(self.transformation, "__dict__", {})
-            content.append(str(sorted(transformation_dict.items())))
+        condition_sets = (
+            (
+                "rule",
+                "rule_conditions",
+                "rule_condition_expression",
+                "rule_condition_linking",
+                "rule_condition_negation",
+            ),
+            (
+                "detection_item",
+                "detection_item_conditions",
+                "detection_item_condition_expression",
+                "detection_item_condition_linking",
+                "detection_item_condition_negation",
+            ),
+            (
+                "field_name",
+                "field_name_conditions",
+                "field_name_condition_expression",
+                "field_name_condition_linking",
+                "field_name_condition_negation",
+            ),
+        )
+        for prefix, conditions_attr, expression_attr, linking_attr, negation_attr in condition_sets:
+            if not hasattr(self, conditions_attr):
+                continue
+            conditions = getattr(self, conditions_attr)
+            expression = getattr(self, expression_attr, None)
+            linking = getattr(self, linking_attr, None)
+            negation = getattr(self, negation_attr, False)
+            content[prefix] = {
+                "conditions": self._canonical_conditions(conditions, expression),
+                "expression": (
+                    self._canonical_condition_expression(expression)
+                    if expression is not None
+                    else None
+                ),
+                "linking": self._canonical_linking(linking, expression),
+                "negation": negation,
+            }
 
-        if hasattr(self, "rule_conditions") and self.rule_conditions:
-            try:
-                content.append(str([str(c) for c in self.rule_conditions]))
-            except TypeError:
-                content.append(str(self.rule_conditions))
-        if hasattr(self, "detection_item_conditions") and getattr(
-            self, "detection_item_conditions", None
-        ):
-            try:
-                content.append(str([str(c) for c in self.detection_item_conditions]))
-            except TypeError:
-                content.append(str(self.detection_item_conditions))
-        if hasattr(self, "field_name_conditions") and getattr(self, "field_name_conditions", None):
-            try:
-                content.append(str([str(c) for c in self.field_name_conditions]))
-            except TypeError:
-                content.append(str(self.field_name_conditions))
-
-        if hasattr(self, "rule_condition_negation"):
-            content.append(str(self.rule_condition_negation))
-        if hasattr(self, "detection_item_condition_negation"):
-            content.append(str(getattr(self, "detection_item_condition_negation", False)))
-        if hasattr(self, "field_name_condition_negation"):
-            content.append(str(getattr(self, "field_name_condition_negation", False)))
-
-        content_str = "|".join(content) if content else str(id(self))
+        content_str = json.dumps(
+            content,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
         return hashlib.sha256(content_str.encode()).hexdigest()[:16]
 
     def _resolve_condition_expression(
@@ -531,6 +785,8 @@ class ProcessingItem(ProcessingItemBase):
             ),
             "Field name condition",
         )
+        if not self._identifier_explicit:
+            self._ensure_identifier()
 
     def set_pipeline(self, pipeline: "ProcessingPipeline") -> None:
         super().set_pipeline(pipeline)
@@ -770,6 +1026,35 @@ class ProcessingPipeline:
         init=False, compare=False, default_factory=dict
     )  # pipeline state: allows to set variables that can be used in conversion (e.g. indices, data model names etc.)
 
+    @staticmethod
+    def _validate_explicit_identifiers(
+        items: Iterable[ProcessingItem | QueryPostprocessingItem],
+        nested_collection: Literal["items", "postprocessing_items"],
+    ) -> None:
+        """Reject duplicate explicit identifiers within a preprocessing/postprocessing tree."""
+        seen: set[str] = set()
+        visited_pipelines: set[int] = set()
+
+        def visit(processing_items: Iterable[ProcessingItem | QueryPostprocessingItem]) -> None:
+            for processing_item in processing_items:
+                if processing_item._identifier_explicit and processing_item.identifier is not None:
+                    if processing_item.identifier in seen:
+                        raise SigmaConfigurationError(
+                            f"Duplicate explicit processing item identifier "
+                            f"'{processing_item.identifier}': explicit identifiers must be "
+                            f"unique within a processing pipeline, including nested pipelines."
+                        )
+                    seen.add(processing_item.identifier)
+
+                nested_pipeline = getattr(processing_item.transformation, "_nested_pipeline", None)
+                if isinstance(nested_pipeline, ProcessingPipeline):
+                    pipeline_id = id(nested_pipeline)
+                    if pipeline_id not in visited_pipelines:
+                        visited_pipelines.add(pipeline_id)
+                        visit(getattr(nested_pipeline, nested_collection))
+
+        visit(items)
+
     def __post_init__(self) -> None:
         if self.items and not all((isinstance(item, ProcessingItem) for item in self.items)):
             raise TypeError(
@@ -785,6 +1070,9 @@ class ProcessingPipeline:
             (isinstance(finalizer, Finalizer) for finalizer in self.finalizers)
         ):
             raise TypeError("Each item in a finalizer pipeline must be a Finalizer")
+
+        self._validate_explicit_identifiers(self.items, "items")
+        self._validate_explicit_identifiers(self.postprocessing_items, "postprocessing_items")
 
         # Initialize contained items with just instantiated processing pipeline as context.
         self.set_pipeline()
